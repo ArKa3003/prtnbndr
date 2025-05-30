@@ -1,1301 +1,1248 @@
 #!/usr/bin/env python3
-"""
-AI-Driven Protein Binder Design Pipeline
-========================================
 
-A cutting-edge end-to-end pipeline for automated structure-based drug design
-and small protein binder generation using state-of-the-art AI/ML techniques.
-
-Features:
-- AlphaFold integration for structure prediction
-- BindCraft-inspired binder design
-- Machine learning-based affinity prediction
-- Automated screening and optimization
-- Multi-objective optimization for drug-like properties
-- Integration with experimental validation workflows
-"""
 
 import os
+import sys
 import json
-import numpy as np
-import pandas as pd
+import subprocess
 import logging
+import argparse
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass, asdict
-from pathlib import Path
-import asyncio
-import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import pickle
+import numpy as np
+import pandas as pd
 from datetime import datetime
 
-# Core ML/AI libraries
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_squared_error
-
-# Computational chemistry and biology
+# Bioinformatics libraries
 try:
-    from rdkit import Chem
-    from rdkit.Chem import Descriptors, rdMolDescriptors
+    import biotite.structure as struc
+    import biotite.structure.io.pdb as pdb
     from Bio import SeqIO
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
 except ImportError:
-    print("Warning: Some optional dependencies not found. Install rdkit-pypi and biopython for full functionality.")
+    print("Installing required bioinformatics libraries...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "biotite", "biopython"])
+    import biotite.structure as struc
+    import biotite.structure.io.pdb as pdb
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
 
-# Molecular dynamics and structure analysis
-import subprocess
-import tempfile
+# ML/AI libraries
+try:
+    import torch
+    import torch.nn.functional as F
+    from transformers import EsmModel, EsmTokenizer
+except ImportError:
+    print("Installing PyTorch and transformers...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "transformers"])
+    import torch
+    import torch.nn.functional as F
+    from transformers import EsmModel, EsmTokenizer
 
-
-@dataclass
-class BinderConfig:
-    """Configuration for binder design parameters"""
-    target_protein: str
-    max_binder_length: int = 100
-    min_binder_length: int = 20
-    affinity_threshold: float = 1e-9  # nM
-    drug_like_filters: bool = True
-    optimize_bbb_permeability: bool = False
-    n_candidates: int = 1000
-    n_top_candidates: int = 50
-
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('binder_pipeline.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class BinderCandidate:
-    """Represents a protein binder candidate"""
+    """Data structure for storing binder candidate information"""
+    id: str
     sequence: str
-    predicted_affinity: float
-    drug_likeness_score: float
-    bbb_permeability: float
-    stability_score: float
-    confidence: float
-    structure_pdb: Optional[str] = None
-
-
-class ProteinStructurePredictor:
-    """
-    Interface to structure prediction models (AlphaFold-based)
-    """
+    structure_path: str
+    binding_score: float
+    folding_confidence: float
+    interaction_energy: float
+    clash_score: float
+    druglikeness_score: float
+    expressibility_score: float
+    generation_method: str
+    target_region: str
     
-    def __init__(self, model_path: Optional[str] = None):
-        self.model_path = model_path
-        self.logger = logging.getLogger(__name__)
+class PipelineConfig:
+    """Configuration class for the binder design pipeline"""
     
-    async def predict_structure(self, sequence: str) -> str:
-        """
-        Predict protein structure from sequence
-        Returns PDB format string
-        """
-        # In a real implementation, this would interface with:
-        # - AlphaFold2/3
-        # - ESMFold
-        # - ChimeraX AlphaFold
-        
-        self.logger.info(f"Predicting structure for sequence of length {len(sequence)}")
-        
-        # Simulate structure prediction
-        await asyncio.sleep(0.1)  # Simulate computation time
-        
-        # Return mock PDB content
-        pdb_content = f"""HEADER    PREDICTED STRUCTURE
-ATOM      1  N   MET A   1      20.154  16.967  21.278  1.00 50.00           N
-ATOM      2  CA  MET A   1      19.030  16.067  21.637  1.00 50.00           C
-ATOM      3  C   MET A   1      18.177  15.737  20.420  1.00 50.00           C
-END
-"""
-        return pdb_content
-
-
-class AffinityPredictor:
-    """
-    Machine learning model for predicting binding affinity
-    """
-    
-    def __init__(self):
-        self.model = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.logger = logging.getLogger(__name__)
-    
-    def extract_features(self, binder_seq: str, target_seq: str) -> np.ndarray:
-        """Extract features from binder and target sequences"""
-        features = []
-        
-        # Sequence-based features
-        features.extend([
-            len(binder_seq),
-            len(target_seq),
-            binder_seq.count('H') / len(binder_seq),  # Hydrophobic residues
-            binder_seq.count('R') + binder_seq.count('K'),  # Positive charges
-            binder_seq.count('D') + binder_seq.count('E'),  # Negative charges
-            binder_seq.count('C'),  # Cysteines (disulfide bonds)
-        ])
-        
-        # Amino acid composition
-        aa_counts = {aa: binder_seq.count(aa) / len(binder_seq) 
-                    for aa in 'ACDEFGHIKLMNPQRSTVWY'}
-        features.extend(aa_counts.values())
-        
-        # Secondary structure prediction features (simplified)
-        helix_propensity = sum(binder_seq.count(aa) for aa in 'AEHILMQRV') / len(binder_seq)
-        sheet_propensity = sum(binder_seq.count(aa) for aa in 'CIFTVWY') / len(binder_seq)
-        features.extend([helix_propensity, sheet_propensity])
-        
-        return np.array(features)
-    
-    def train(self, training_data: List[Tuple[str, str, float]]):
-        """Train the affinity prediction model"""
-        X = []
-        y = []
-        
-        for binder_seq, target_seq, affinity in training_data:
-            features = self.extract_features(binder_seq, target_seq)
-            X.append(features)
-            y.append(-np.log10(affinity))  # Convert to -log10(Kd)
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Use ensemble of models for better predictions
-        self.model = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        self.model.fit(X_scaled, y)
-        self.is_trained = True
-        
-        self.logger.info("Affinity prediction model trained successfully")
-    
-    def predict_affinity(self, binder_seq: str, target_seq: str) -> Tuple[float, float]:
-        """Predict binding affinity and confidence"""
-        if not self.is_trained:
-            # Use a pre-trained model or return estimated values
-            return 1e-8, 0.5
-        
-        features = self.extract_features(binder_seq, target_seq)
-        features_scaled = self.scaler.transform(features.reshape(1, -1))
-        
-        log_affinity = self.model.predict(features_scaled)[0]
-        affinity = 10 ** (-log_affinity)
-        
-        # Estimate confidence based on feature importance and prediction variance
-        confidence = min(0.9, max(0.1, 1.0 - abs(log_affinity - 8) / 5))
-        
-        return affinity, confidence
-
-
-class DrugLikenessPredictor:
-    """
-    Predict drug-likeness properties for protein binders
-    """
-    
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-    
-    def calculate_properties(self, sequence: str) -> Dict[str, float]:
-        """Calculate drug-like properties for a protein sequence"""
-        properties = {}
-        
-        # Molecular weight estimation (simplified)
-        aa_weights = {
-            'A': 71.04, 'R': 156.10, 'N': 114.04, 'D': 115.03, 'C': 103.01,
-            'E': 129.04, 'Q': 128.06, 'G': 57.02, 'H': 137.06, 'I': 113.08,
-            'L': 113.08, 'K': 128.09, 'M': 131.04, 'F': 147.07, 'P': 97.05,
-            'S': 87.03, 'T': 101.05, 'W': 186.08, 'Y': 163.06, 'V': 99.07
+    def __init__(self, config_path: Optional[str] = None):
+        self.base_config = {
+            # Target protein configuration
+            "target_pdb_path": "kainate_receptor_ATD.pdb",
+            "target_chain": "A",
+            "binding_site_residues": [50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60],  # hop bot region
+            
+            # RFdiffusion parameters
+            "rfdiffusion": {
+                "num_designs": 1000,
+                "length": [50, 80],  # binder length range
+                "hotspot_residues": [],
+                "contigs": "50-80",
+                "iterations": 50,
+                "noise_scale": 1.0,
+                "scaffold_guided": True
+            },
+            
+            # ProteinMPNN parameters
+            "proteinmpnn": {
+                "num_sequences": 8,
+                "temperature": 0.1,
+                "batch_size": 1,
+                "omit_AA": "CX",  # Omit cysteine and unknown amino acids
+                "bias_AA": {"K": 0.1, "R": 0.1, "E": -0.1, "D": -0.1}  # Bias for/against certain AAs
+            },
+            
+            # AlphaFold parameters
+            "alphafold": {
+                "model_type": "alphafold3",  # or "alphafold2"
+                "max_msa_clusters": 512,
+                "max_extra_msa": 1024,
+                "relaxation_steps": 200
+            },
+            
+            # Filtering thresholds
+            "filtering": {
+                "min_binding_score": 5.0,
+                "min_folding_confidence": 0.7,
+                "max_clash_score": 2.0,
+                "min_interaction_energy": -10.0,
+                "min_expressibility": 0.6
+            },
+            
+            # Output configuration
+            "output_dir": "binder_designs",
+            "max_final_candidates": 20,
+            "parallel_processes": 4
         }
         
-        mw = sum(aa_weights.get(aa, 110) for aa in sequence) - 18 * (len(sequence) - 1)
-        properties['molecular_weight'] = mw
-        
-        # Size-based drug-likeness (smaller is better for BBB penetration)
-        properties['size_score'] = max(0, 1 - (len(sequence) - 20) / 80)
-        
-        # Charge properties
-        positive_charges = sequence.count('R') + sequence.count('K')
-        negative_charges = sequence.count('D') + sequence.count('E')
-        net_charge = abs(positive_charges - negative_charges)
-        properties['charge_balance'] = max(0, 1 - net_charge / 5)
-        
-        # Hydrophobicity (important for membrane permeability)
-        hydrophobic_aa = 'AILMFPWV'
-        hydrophobicity = sum(sequence.count(aa) for aa in hydrophobic_aa) / len(sequence)
-        properties['hydrophobicity'] = hydrophobicity
-        
-        # Stability indicators
-        properties['stability_score'] = self._estimate_stability(sequence)
-        
-        return properties
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                user_config = json.load(f)
+                self._update_nested_dict(self.base_config, user_config)
     
-    def _estimate_stability(self, sequence: str) -> float:
-        """Estimate protein stability based on sequence features"""
-        # Simplified stability prediction
-        disulfides = sequence.count('C') // 2
-        prolines = sequence.count('P')
-        aromatic = sum(sequence.count(aa) for aa in 'FWY')
-        
-        stability = (disulfides * 0.2 + prolines * 0.1 + aromatic * 0.15) / len(sequence)
-        return min(1.0, stability * 5)
+    def _update_nested_dict(self, base_dict, update_dict):
+        """Recursively update nested dictionary"""
+        for key, value in update_dict.items():
+            if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
+                self._update_nested_dict(base_dict[key], value)
+            else:
+                base_dict[key] = value
     
-    def calculate_drug_likeness(self, sequence: str) -> float:
-        """Calculate overall drug-likeness score"""
-        props = self.calculate_properties(sequence)
-        
-        # Weighted combination of properties
-        score = (
-            props['size_score'] * 0.3 +
-            props['charge_balance'] * 0.2 +
-            props['hydrophobicity'] * 0.25 +
-            props['stability_score'] * 0.25
-        )
-        
-        return score
-    
-    def predict_bbb_permeability(self, sequence: str) -> float:
-        """Predict blood-brain barrier permeability"""
-        props = self.calculate_properties(sequence)
-        
-        # BBB permeability is favored by:
-        # - Small size
-        # - Balanced hydrophobicity
-        # - Low net charge
-        
-        size_factor = props['size_score']
-        charge_factor = props['charge_balance']
-        hydro_factor = 1 - abs(props['hydrophobicity'] - 0.4)  # Optimal around 0.4
-        
-        bbb_score = (size_factor * 0.4 + charge_factor * 0.4 + hydro_factor * 0.2)
-        return bbb_score
+    def get(self, key_path: str, default=None):
+        """Get configuration value using dot notation"""
+        keys = key_path.split('.')
+        current = self.base_config
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return default
+        return current
 
+class EnvironmentManager:
+    """Manages conda environments and dependencies"""
+    
+    @staticmethod
+    def setup_rfdiffusion_env():
+        """Set up RFdiffusion environment"""
+        env_name = "rfdiffusion"
+        logger.info(f"Setting up {env_name} environment...")
+        
+        commands = [
+            f"conda create -n {env_name} python=3.9 -y",
+            f"conda activate {env_name}",
+            "conda install pytorch pytorch-cuda=11.8 -c pytorch -c nvidia -y",
+            "pip install hydra-core omegaconf",
+            "git clone https://github.com/RosettaCommons/RFdiffusion.git",
+            "cd RFdiffusion && pip install -e .",
+            "cd .."
+        ]
+        
+        for cmd in commands:
+            try:
+                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                logger.info(f"Successfully executed: {cmd}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to execute: {cmd}")
+                logger.error(f"Error: {e.stderr}")
+                raise
+    
+    @staticmethod
+    def setup_proteinmpnn_env():
+        """Set up ProteinMPNN environment"""
+        env_name = "proteinmpnn"
+        logger.info(f"Setting up {env_name} environment...")
+        
+        commands = [
+            f"conda create -n {env_name} python=3.8 -y",
+            f"conda activate {env_name}",
+            "conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia -y",
+            "git clone https://github.com/dauparas/ProteinMPNN.git",
+            "cd ProteinMPNN && pip install -r requirements.txt",
+            "cd .."
+        ]
+        
+        for cmd in commands:
+            try:
+                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                logger.info(f"Successfully executed: {cmd}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to execute: {cmd}")
+                logger.error(f"Error: {e.stderr}")
+                raise
+    
+    @staticmethod
+    def setup_alphafold_env():
+        """Set up AlphaFold environment"""
+        env_name = "alphafold"
+        logger.info(f"Setting up {env_name} environment...")
+        
+        commands = [
+            f"conda create -n {env_name} python=3.9 -y",
+            f"conda activate {env_name}",
+            "pip install colabfold[alphafold] --no-warn-conflicts",
+            "pip install alphafold3-pytorch",
+            "pip install jax jaxlib",
+        ]
+        
+        for cmd in commands:
+            try:
+                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                logger.info(f"Successfully executed: {cmd}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to execute: {cmd}")
+                logger.error(f"Error: {e.stderr}")
+                raise
 
-class SequenceGenerator:
-    """
-    Generate protein binder sequences using various strategies
-    """
+class StructureAnalyzer:
+    """Analyzes protein structures and binding interactions"""
     
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
+    @staticmethod
+    def load_structure(pdb_path: str):
+        """Load protein structure from PDB file"""
+        try:
+            with open(pdb_path, 'r') as f:
+                structure = pdb.PDBFile.read(f)
+            return structure
+        except Exception as e:
+            logger.error(f"Failed to load structure from {pdb_path}: {e}")
+            raise
     
-    def generate_random_sequences(self, n: int, min_len: int, max_len: int) -> List[str]:
-        """Generate random protein sequences"""
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-        sequences = []
+    @staticmethod
+    def calculate_binding_score(target_struct, binder_struct) -> float:
+        """Calculate binding score between target and binder"""
+        # Simplified binding score calculation
+        # In practice, you'd use more sophisticated methods like PyRosetta scoring
         
-        for _ in range(n):
-            length = np.random.randint(min_len, max_len + 1)
-            sequence = ''.join(np.random.choice(list(amino_acids), length))
-            sequences.append(sequence)
+        # Get atom coordinates
+        target_coords = target_struct.coord
+        binder_coords = binder_struct.coord
         
-        return sequences
+        # Calculate minimum distance between structures
+        min_distances = []
+        for t_coord in target_coords:
+            distances = np.linalg.norm(binder_coords - t_coord, axis=1)
+            min_distances.append(np.min(distances))
+        
+        # Simple scoring based on interface area and distance
+        interface_contacts = np.sum(np.array(min_distances) < 4.0)  # Within 4Å
+        binding_score = interface_contacts / len(min_distances) * 10.0
+        
+        return binding_score
     
-    def generate_template_based(self, template: str, n: int, mutation_rate: float = 0.2) -> List[str]:
-        """Generate sequences based on a template with mutations"""
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-        sequences = []
+    @staticmethod
+    def check_clashes(target_struct, binder_struct, clash_threshold: float = 2.0) -> float:
+        """Check for steric clashes between target and binder"""
+        target_coords = target_struct.coord
+        binder_coords = binder_struct.coord
         
-        for _ in range(n):
-            sequence = list(template)
-            n_mutations = int(len(template) * mutation_rate)
+        clash_count = 0
+        total_contacts = 0
+        
+        for t_coord in target_coords:
+            distances = np.linalg.norm(binder_coords - t_coord, axis=1)
+            contacts = distances < 4.0
+            clashes = distances < clash_threshold
             
-            for _ in range(n_mutations):
-                pos = np.random.randint(len(sequence))
-                sequence[pos] = np.random.choice(list(amino_acids))
-            
-            sequences.append(''.join(sequence))
+            total_contacts += np.sum(contacts)
+            clash_count += np.sum(clashes)
         
-        return sequences
-    
-    def generate_motif_based(self, target_sequence: str, n: int) -> List[str]:
-        """Generate sequences with motifs that might bind to target"""
-        # Simplified motif-based generation
-        # In practice, this would use more sophisticated binding motif databases
+        if total_contacts == 0:
+            return 0.0
         
-        sequences = []
-        motifs = self._extract_binding_motifs(target_sequence)
-        
-        for _ in range(n):
-            # Build sequence around motifs
-            sequence = self._build_sequence_with_motifs(motifs)
-            sequences.append(sequence)
-        
-        return sequences
-    
-    def _extract_binding_motifs(self, target_seq: str) -> List[str]:
-        """Extract potential binding motifs from target sequence"""
-        # Simplified motif extraction
-        motifs = []
-        
-        # Look for charged regions
-        for i in range(len(target_seq) - 3):
-            window = target_seq[i:i+4]
-            if sum(window.count(aa) for aa in 'RK') >= 2:
-                motifs.append('DE' * (len(window) // 2))  # Complementary charges
-        
-        return motifs[:3]  # Take top 3 motifs
-    
-    def _build_sequence_with_motifs(self, motifs: List[str]) -> str:
-        """Build a sequence incorporating binding motifs"""
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-        
-        # Start with random sequence
-        base_length = np.random.randint(20, 60)
-        sequence = [np.random.choice(list(amino_acids)) for _ in range(base_length)]
-        
-        # Insert motifs at random positions
-        for motif in motifs:
-            if len(sequence) + len(motif) < 100:  # Size limit
-                pos = np.random.randint(len(sequence))
-                sequence[pos:pos] = list(motif)
-        
-        return ''.join(sequence)
+        return clash_count / total_contacts * 100.0
 
-
-class BinderOptimizer:
-    """
-    Multi-objective optimization for binder sequences
-    """
+class RFDiffusionRunner:
+    """Wrapper for running RFdiffusion"""
     
-    def __init__(self, affinity_predictor: AffinityPredictor, 
-                 drug_predictor: DrugLikenessPredictor):
-        self.affinity_predictor = affinity_predictor
-        self.drug_predictor = drug_predictor
-        self.logger = logging.getLogger(__name__)
-    
-    def optimize_sequence(self, initial_seq: str, target_seq: str, 
-                         n_iterations: int = 100) -> str:
-        """Optimize a sequence using genetic algorithm principles"""
-        current_seq = initial_seq
-        current_score = self._score_sequence(current_seq, target_seq)
-        
-        for iteration in range(n_iterations):
-            # Generate mutations
-            mutated_seqs = self._generate_mutations(current_seq, n_mutations=5)
-            
-            # Evaluate mutations
-            best_mutant = current_seq
-            best_score = current_score
-            
-            for mutant in mutated_seqs:
-                score = self._score_sequence(mutant, target_seq)
-                if score > best_score:
-                    best_mutant = mutant
-                    best_score = score
-            
-            # Accept improvement
-            if best_score > current_score:
-                current_seq = best_mutant
-                current_score = best_score
-                self.logger.debug(f"Iteration {iteration}: Score improved to {best_score:.3f}")
-        
-        return current_seq
-    
-    def _score_sequence(self, binder_seq: str, target_seq: str) -> float:
-        """Multi-objective scoring function"""
-        affinity, confidence = self.affinity_predictor.predict_affinity(binder_seq, target_seq)
-        drug_score = self.drug_predictor.calculate_drug_likeness(binder_seq)
-        bbb_score = self.drug_predictor.predict_bbb_permeability(binder_seq)
-        
-        # Weighted combination
-        score = (
-            -np.log10(affinity) * 0.4 +  # Higher affinity is better
-            drug_score * 0.3 +
-            bbb_score * 0.2 +
-            confidence * 0.1
-        )
-        
-        return score
-    
-    def _generate_mutations(self, sequence: str, n_mutations: int) -> List[str]:
-        """Generate mutated versions of a sequence"""
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-        mutants = []
-        
-        for _ in range(n_mutations):
-            mutant = list(sequence)
-            # Point mutations
-            n_changes = np.random.randint(1, min(4, len(sequence) // 10))
-            
-            for _ in range(n_changes):
-                pos = np.random.randint(len(mutant))
-                mutant[pos] = np.random.choice(list(amino_acids))
-            
-            mutants.append(''.join(mutant))
-        
-        return mutants
-
-
-class BinderDesignPipeline:
-    """
-    Main pipeline for automated binder design
-    """
-    
-    def __init__(self, config: BinderConfig):
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.logger = self._setup_logging()
+        self.rfdiffusion_path = "RFdiffusion"
+        
+    def run_generation(self, target_pdb: str, output_dir: str) -> List[str]:
+        """Run RFdiffusion to generate binder backbones"""
+        logger.info("Starting RFdiffusion binder generation...")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Prepare RFdiffusion command
+        cmd = [
+            "conda", "run", "-n", "rfdiffusion", "python", 
+            f"{self.rfdiffusion_path}/scripts/run_inference.py",
+            f"inference.output_prefix={output_dir}/binder",
+            f"inference.input_pdb={target_pdb}",
+            f"inference.num_designs={self.config.get('rfdiffusion.num_designs')}",
+            f"contigmap.contigs=[{self.config.get('rfdiffusion.contigs')}]",
+            f"inference.ckpt_override_path={self.rfdiffusion_path}/models/Base_ckpt.pt",
+            "inference.write_trajectory=False"
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info("RFdiffusion completed successfully")
+            
+            # Collect generated PDB files
+            generated_pdbs = list(Path(output_dir).glob("binder_*.pdb"))
+            logger.info(f"Generated {len(generated_pdbs)} binder backbones")
+            
+            return [str(pdb) for pdb in generated_pdbs]
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"RFdiffusion failed: {e.stderr}")
+            raise
+
+class ProteinMPNNRunner:
+    """Wrapper for running ProteinMPNN"""
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.proteinmpnn_path = "ProteinMPNN"
+        
+    def design_sequences(self, backbone_pdbs: List[str], output_dir: str) -> Dict[str, List[str]]:
+        """Design sequences for binder backbones using ProteinMPNN"""
+        logger.info(f"Designing sequences for {len(backbone_pdbs)} backbones...")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        sequence_designs = {}
+        
+        for pdb_path in backbone_pdbs:
+            pdb_name = Path(pdb_path).stem
+            
+            # Prepare ProteinMPNN command
+            cmd = [
+                "conda", "run", "-n", "proteinmpnn", "python",
+                f"{self.proteinmpnn_path}/protein_mpnn_run.py",
+                "--pdb_path", pdb_path,
+                "--out_folder", output_dir,
+                "--num_seq_per_target", str(self.config.get('proteinmpnn.num_sequences')),
+                "--sampling_temp", str(self.config.get('proteinmpnn.temperature')),
+                "--batch_size", str(self.config.get('proteinmpnn.batch_size')),
+                "--omit_AAs", self.config.get('proteinmpnn.omit_AA', '')
+            ]
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                
+                # Parse output sequences
+                fasta_file = Path(output_dir) / f"seqs/{pdb_name}.fa"
+                if fasta_file.exists():
+                    sequences = []
+                    for record in SeqIO.parse(fasta_file, "fasta"):
+                        sequences.append(str(record.seq))
+                    sequence_designs[pdb_name] = sequences
+                    
+            except subprocess.CalledProcessError as e:
+                logger.error(f"ProteinMPNN failed for {pdb_path}: {e.stderr}")
+                continue
+        
+        total_sequences = sum(len(seqs) for seqs in sequence_designs.values())
+        logger.info(f"Generated {total_sequences} sequence designs")
+        
+        return sequence_designs
+
+class AlphaFoldRunner:
+    """Wrapper for running AlphaFold predictions"""
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        
+    def predict_complex_structure(self, target_seq: str, binder_seq: str, output_dir: str) -> Tuple[str, float]:
+        """Predict structure of target-binder complex"""
+        logger.info("Predicting complex structure with AlphaFold...")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create combined sequence for complex prediction
+        complex_seq = target_seq + ":" + binder_seq
+        
+        # Use ColabFold for fast structure prediction
+        cmd = [
+            "conda", "run", "-n", "alphafold",
+            "colabfold_batch",
+            "--amber", "--use-gpu-relax",
+            complex_seq,
+            output_dir
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            # Find predicted structure file
+            pdb_files = list(Path(output_dir).glob("*.pdb"))
+            if pdb_files:
+                pdb_path = str(pdb_files[0])
+                
+                # Extract confidence score from file
+                confidence = self._extract_confidence_score(pdb_path)
+                
+                return pdb_path, confidence
+            else:
+                logger.error("No PDB file generated by AlphaFold")
+                return None, 0.0
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"AlphaFold prediction failed: {e.stderr}")
+            return None, 0.0
+    
+    def _extract_confidence_score(self, pdb_path: str) -> float:
+        """Extract confidence score from AlphaFold PDB file"""
+        try:
+            structure = self._load_structure(pdb_path)
+            # AlphaFold stores confidence in B-factor field
+            confidence_scores = structure.b_factor
+            return np.mean(confidence_scores) / 100.0  # Convert to 0-1 scale
+        except:
+            return 0.0
+    
+    def _load_structure(self, pdb_path: str):
+        """Load structure using biotite"""
+        with open(pdb_path, 'r') as f:
+            return pdb.PDBFile.read(f)
+
+class BinderScorer:
+    """Comprehensive scoring system for binder candidates"""
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        
+        # Load ESM model for protein representation
+        try:
+            self.esm_tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
+            self.esm_model = EsmModel.from_pretrained("facebook/esm2_t6_8M_UR50D")
+            self.esm_model.eval()
+        except:
+            logger.warning("Could not load ESM model for advanced scoring")
+            self.esm_model = None
+    
+    def score_binder(self, candidate: BinderCandidate, target_structure_path: str) -> BinderCandidate:
+        """Comprehensive scoring of binder candidate"""
+        
+        # Load structures
+        try:
+            target_struct = StructureAnalyzer.load_structure(target_structure_path)
+            binder_struct = StructureAnalyzer.load_structure(candidate.structure_path)
+            
+            # Calculate binding score
+            candidate.binding_score = StructureAnalyzer.calculate_binding_score(target_struct, binder_struct)
+            
+            # Calculate clash score
+            candidate.clash_score = StructureAnalyzer.check_clashes(target_struct, binder_struct)
+            
+            # Calculate interaction energy (simplified)
+            candidate.interaction_energy = self._estimate_interaction_energy(candidate.sequence)
+            
+            # Calculate druglikeness score
+            candidate.druglikeness_score = self._calculate_druglikeness(candidate.sequence)
+            
+            # Calculate expressibility score
+            candidate.expressibility_score = self._calculate_expressibility(candidate.sequence)
+            
+        except Exception as e:
+            logger.error(f"Error scoring candidate {candidate.id}: {e}")
+            # Set default low scores
+            candidate.binding_score = 0.0
+            candidate.clash_score = 100.0
+            candidate.interaction_energy = 0.0
+            candidate.druglikeness_score = 0.0
+            candidate.expressibility_score = 0.0
+        
+        return candidate
+    
+    def _estimate_interaction_energy(self, sequence: str) -> float:
+        """Estimate interaction energy based on sequence composition"""
+        # Simplified energy calculation based on amino acid properties
+        energy_values = {
+            'R': -1.5, 'K': -1.2, 'H': -0.8,  # Positive charges
+            'D': -1.3, 'E': -1.1,             # Negative charges
+            'F': -0.9, 'W': -1.0, 'Y': -0.7,  # Aromatics
+            'L': -0.5, 'I': -0.5, 'V': -0.4,  # Hydrophobics
+            'S': -0.2, 'T': -0.2, 'N': -0.3, 'Q': -0.3,  # Polar
+            'G': 0.0, 'A': -0.1, 'P': 0.2,    # Small/flexible
+            'C': -0.6, 'M': -0.4               # Sulfur-containing
+        }
+        
+        total_energy = sum(energy_values.get(aa, 0.0) for aa in sequence)
+        return total_energy
+    
+    def _calculate_druglikeness(self, sequence: str) -> float:
+        """Calculate druglikeness score based on sequence properties"""
+        # Check for problematic sequences
+        if len(sequence) > 100:  # Too long
+            return 0.1
+        if len(sequence) < 20:   # Too short
+            return 0.2
+        
+        # Count problematic amino acids
+        problematic_count = sequence.count('C') + sequence.count('M') + sequence.count('P')
+        if problematic_count > len(sequence) * 0.2:  # More than 20% problematic
+            return 0.3
+        
+        # Balanced composition score
+        aa_counts = {}
+        for aa in sequence:
+            aa_counts[aa] = aa_counts.get(aa, 0) + 1
+        
+        # Check for diversity
+        diversity = len(aa_counts) / 20.0  # Number of different AAs / 20
+        
+        return min(1.0, diversity + 0.3)
+    
+    def _calculate_expressibility(self, sequence: str) -> float:
+        """Calculate bacterial expressibility score"""
+        # Factors that affect expression in E. coli
+        
+        # Avoid rare codons (simplified)
+        rare_aa_penalty = sequence.count('R') + sequence.count('L') * 0.5
+        rare_penalty = min(0.5, rare_aa_penalty / len(sequence))
+        
+        # Avoid aggregation-prone sequences
+        hydrophobic_stretch = self._find_max_hydrophobic_stretch(sequence)
+        aggregation_penalty = min(0.3, hydrophobic_stretch / 10.0)
+        
+        # Avoid too many charged residues
+        charged_count = sequence.count('R') + sequence.count('K') + sequence.count('D') + sequence.count('E')
+        charge_penalty = min(0.2, (charged_count / len(sequence) - 0.3))
+        
+        base_score = 1.0
+        final_score = base_score - rare_penalty - aggregation_penalty - max(0, charge_penalty)
+        
+        return max(0.0, final_score)
+    
+    def _find_max_hydrophobic_stretch(self, sequence: str) -> int:
+        """Find maximum consecutive hydrophobic amino acid stretch"""
+        hydrophobic = set(['F', 'W', 'Y', 'L', 'I', 'V', 'M', 'A'])
+        
+        max_stretch = 0
+        current_stretch = 0
+        
+        for aa in sequence:
+            if aa in hydrophobic:
+                current_stretch += 1
+                max_stretch = max(max_stretch, current_stretch)
+            else:
+                current_stretch = 0
+        
+        return max_stretch
+
+class BinderPipeline:
+    """Main pipeline orchestrator"""
+    
+    def __init__(self, config_path: Optional[str] = None):
+        self.config = PipelineConfig(config_path)
+        self.output_dir = Path(self.config.get('output_dir'))
+        self.output_dir.mkdir(exist_ok=True)
         
         # Initialize components
-        self.structure_predictor = ProteinStructurePredictor()
-        self.affinity_predictor = AffinityPredictor()
-        self.drug_predictor = DrugLikenessPredictor()
-        self.sequence_generator = SequenceGenerator()
-        self.optimizer = BinderOptimizer(self.affinity_predictor, self.drug_predictor)
+        self.rfdiffusion = RFDiffusionRunner(self.config)
+        self.proteinmpnn = ProteinMPNNRunner(self.config)
+        self.alphafold = AlphaFoldRunner(self.config)
+        self.scorer = BinderScorer(self.config)
         
         # Results storage
         self.candidates: List[BinderCandidate] = []
-        self.results_dir = Path(f"binder_design_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        self.results_dir.mkdir(exist_ok=True)
+        
+    def setup_environments(self):
+        """Set up all required conda environments"""
+        logger.info("Setting up computational environments...")
+        
+        try:
+            EnvironmentManager.setup_rfdiffusion_env()
+            EnvironmentManager.setup_proteinmpnn_env()
+            EnvironmentManager.setup_alphafold_env()
+            logger.info("All environments set up successfully")
+        except Exception as e:
+            logger.error(f"Failed to set up environments: {e}")
+            raise
     
-    def _setup_logging(self) -> logging.Logger:
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('binder_pipeline.log'),
-                logging.StreamHandler()
-            ]
-        )
-        return logging.getLogger(__name__)
-    
-    async def run_pipeline(self) -> List[BinderCandidate]:
+    def run_pipeline(self, target_pdb_path: str, target_sequence: str):
         """Run the complete binder design pipeline"""
-        self.logger.info("Starting binder design pipeline")
-        self.logger.info(f"Target protein: {self.config.target_protein}")
+        logger.info("Starting binder design pipeline...")
         
-        # Step 1: Generate initial candidate sequences
-        self.logger.info("Generating initial candidate sequences...")
-        initial_sequences = await self._generate_candidates()
+        # Step 1: Generate binder backbones with RFdiffusion
+        backbone_dir = self.output_dir / "backbones"
+        backbone_pdbs = self.rfdiffusion.run_generation(target_pdb_path, str(backbone_dir))
         
-        # Step 2: Predict affinities
-        self.logger.info("Predicting binding affinities...")
-        await self._predict_affinities(initial_sequences)
+        # Filter backbones (remove obviously bad structures)
+        filtered_backbones = self._filter_backbones(backbone_pdbs)
+        logger.info(f"Filtered to {len(filtered_backbones)} good backbones")
         
-        # Step 3: Filter by affinity threshold
-        self.logger.info("Filtering by affinity threshold...")
-        high_affinity_candidates = [
-            c for c in self.candidates 
-            if c.predicted_affinity <= self.config.affinity_threshold
-        ]
+        # Step 2: Design sequences with ProteinMPNN
+        sequence_dir = self.output_dir / "sequences"
+        sequence_designs = self.proteinmpnn.design_sequences(filtered_backbones, str(sequence_dir))
         
-        # Step 4: Optimize top candidates
-        self.logger.info("Optimizing top candidates...")
-        optimized_candidates = await self._optimize_candidates(high_affinity_candidates)
+        # Step 3: Predict complex structures and score candidates
+        self._process_candidates(sequence_designs, target_sequence, target_pdb_path)
         
-        # Step 5: Final evaluation and ranking
-        self.logger.info("Final evaluation and ranking...")
-        final_candidates = await self._final_evaluation(optimized_candidates)
+        # Step 4: Filter and rank candidates
+        final_candidates = self._filter_and_rank_candidates()
         
-        # Step 6: Generate outputs
-        await self._generate_outputs(final_candidates)
+        # Step 5: Generate final report
+        self._generate_report(final_candidates)
         
-        self.logger.info(f"Pipeline completed. Generated {len(final_candidates)} final candidates")
+        logger.info("Pipeline completed successfully")
         return final_candidates
     
-    async def _generate_candidates(self) -> List[str]:
-        """Generate initial candidate sequences"""
-        sequences = []
+    def _filter_backbones(self, backbone_pdbs: List[str]) -> List[str]:
+        """Filter backbone structures based on quality metrics"""
+        filtered = []
         
-        # Random generation
-        random_seqs = self.sequence_generator.generate_random_sequences(
-            self.config.n_candidates // 3,
-            self.config.min_binder_length,
-            self.config.max_binder_length
-        )
-        sequences.extend(random_seqs)
+        for pdb_path in backbone_pdbs:
+            try:
+                structure = StructureAnalyzer.load_structure(pdb_path)
+                
+                # Basic quality checks
+                if len(structure.coord) < 20:  # Too small
+                    continue
+                if len(structure.coord) > 200:  # Too large
+                    continue
+                
+                # Check for reasonable secondary structure (simplified)
+                # In practice, you'd use DSSP or similar
+                
+                filtered.append(pdb_path)
+                
+            except Exception as e:
+                logger.warning(f"Failed to analyze backbone {pdb_path}: {e}")
+                continue
         
-        # Template-based generation (if we have known binders)
-        template_seq = "MGSHHHHHHGSGSENLYFQGSH"  # Example template
-        template_seqs = self.sequence_generator.generate_template_based(
-            template_seq,
-            self.config.n_candidates // 3
-        )
-        sequences.extend(template_seqs)
-        
-        # Motif-based generation
-        motif_seqs = self.sequence_generator.generate_motif_based(
-            self.config.target_protein,
-            self.config.n_candidates // 3
-        )
-        sequences.extend(motif_seqs)
-        
-        return sequences
+        return filtered
     
-    async def _predict_affinities(self, sequences: List[str]):
-        """Predict binding affinities for all sequences"""
-        # Train affinity predictor if needed (with mock data for demo)
-        if not self.affinity_predictor.is_trained:
-            training_data = self._generate_training_data()
-            self.affinity_predictor.train(training_data)
+    def _process_candidates(self, sequence_designs: Dict[str, List[str]], 
+                          target_sequence: str, target_pdb_path: str):
+        """Process all candidate binders"""
+        logger.info("Processing candidate binders...")
         
-        # Predict affinities
-        for seq in sequences:
-            affinity, confidence = self.affinity_predictor.predict_affinity(
-                seq, self.config.target_protein
-            )
-            
-            drug_score = self.drug_predictor.calculate_drug_likeness(seq)
-            bbb_score = self.drug_predictor.predict_bbb_permeability(seq)
-            
-            # Predict structure
-            structure_pdb = await self.structure_predictor.predict_structure(seq)
-            
-            candidate = BinderCandidate(
-                sequence=seq,
-                predicted_affinity=affinity,
-                drug_likeness_score=drug_score,
-                bbb_permeability=bbb_score,
-                stability_score=self.drug_predictor.calculate_properties(seq)['stability_score'],
-                confidence=confidence,
-                structure_pdb=structure_pdb
-            )
-            
-            self.candidates.append(candidate)
+        candidate_id = 0
+        complex_dir = self.output_dir / "complexes"
+        complex_dir.mkdir(exist_ok=True)
+        
+        for backbone_name, sequences in sequence_designs.items():
+            for seq_idx, sequence in enumerate(sequences):
+                candidate_id += 1
+                
+                # Create candidate
+                candidate = BinderCandidate(
+                    id=f"binder_{candidate_id:04d}",
+                    sequence=sequence,
+                    structure_path="",  # Will be filled after AlphaFold
+                    binding_score=0.0,
+                    folding_confidence=0.0,
+                    interaction_energy=0.0,
+                    clash_score=0.0,
+                    druglikeness_score=0.0,
+                    expressibility_score=0.0,
+                    generation_method="RFdiffusion+ProteinMPNN",
+                    target_region="amino_terminal_domain"
+                )
+                
+                # Predict complex structure
+                complex_output_dir = complex_dir / candidate.id
+                complex_output_dir.mkdir(exist_ok=True)
+                
+                structure_path, confidence = self.alphafold.predict_complex_structure(
+                    target_sequence, sequence, str(complex_output_dir)
+                )
+                
+                if structure_path:
+                    candidate.structure_path = structure_path
+                    candidate.folding_confidence = confidence
+                    
+                    # Score the candidate
+                    candidate = self.scorer.score_binder(candidate, target_pdb_path)
+                    
+                    self.candidates.append(candidate)
+                
+                # Progress logging
+                if candidate_id % 50 == 0:
+                    logger.info(f"Processed {candidate_id} candidates...")
     
-    def _generate_training_data(self) -> List[Tuple[str, str, float]]:
-        """Generate mock training data for affinity predictor"""
-        # In practice, this would load real experimental data
-        training_data = []
+    def _filter_and_rank_candidates(self) -> List[BinderCandidate]:
+        """Filter and rank candidate binders"""
+        logger.info(f"Filtering and ranking {len(self.candidates)} candidates...")
         
-        # Mock data generation
-        for _ in range(100):
-            binder_seq = ''.join(np.random.choice(list('ACDEFGHIKLMNPQRSTVWY'), 
-                                                 np.random.randint(20, 50)))
-            target_seq = self.config.target_protein
-            affinity = np.random.lognormal(-8, 2)  # Mock affinity values
-            
-            training_data.append((binder_seq, target_seq, affinity))
+        # Apply filtering thresholds
+        filtered_candidates = []
+        thresholds = self.config.get('filtering')
         
-        return training_data
-    
-    async def _optimize_candidates(self, candidates: List[BinderCandidate]) -> List[BinderCandidate]:
-        """Optimize promising candidates"""
-        # Sort by combined score
-        candidates.sort(key=lambda x: (
-            -np.log10(x.predicted_affinity) * 0.4 +
-            x.drug_likeness_score * 0.3 +
-            x.bbb_permeability * 0.2 +
-            x.confidence * 0.1
-        ), reverse=True)
+        for candidate in self.candidates:
+            if (candidate.binding_score >= thresholds['min_binding_score'] and
+                candidate.folding_confidence >= thresholds['min_folding_confidence'] and
+                candidate.clash_score <= thresholds['max_clash_score'] and
+                candidate.interaction_energy <= thresholds['min_interaction_energy'] and
+                candidate.expressibility_score >= thresholds['min_expressibility']):
+                
+                filtered_candidates.append(candidate)
         
-        # Optimize top candidates
-        top_candidates = candidates[:self.config.n_top_candidates]
-        optimized = []
+        logger.info(f"Filtered to {len(filtered_candidates)} candidates")
         
-        for candidate in top_candidates:
-            optimized_seq = self.optimizer.optimize_sequence(
-                candidate.sequence,
-                self.config.target_protein,
-                n_iterations=50
-            )
-            
-            # Re-evaluate optimized sequence
-            affinity, confidence = self.affinity_predictor.predict_affinity(
-                optimized_seq, self.config.target_protein
-            )
-            drug_score = self.drug_predictor.calculate_drug_likeness(optimized_seq)
-            bbb_score = self.drug_predictor.predict_bbb_permeability(optimized_seq)
-            
-            optimized_candidate = BinderCandidate(
-                sequence=optimized_seq,
-                predicted_affinity=affinity,
-                drug_likeness_score=drug_score,
-                bbb_permeability=bbb_score,
-                stability_score=self.drug_predictor.calculate_properties(optimized_seq)['stability_score'],
-                confidence=confidence,
-                structure_pdb=await self.structure_predictor.predict_structure(optimized_seq)
-            )
-            
-            optimized.append(optimized_candidate)
+        # Rank by composite score
+        for candidate in filtered_candidates:
+            candidate.composite_score = self._calculate_composite_score(candidate)
         
-        return optimized
-    
-    async def _final_evaluation(self, candidates: List[BinderCandidate]) -> List[BinderCandidate]:
-        """Final evaluation and ranking of candidates"""
-        # Apply drug-likeness filters if enabled
-        if self.config.drug_like_filters:
-            candidates = [c for c in candidates if c.drug_likeness_score > 0.5]
-        
-        # Sort by multi-objective score
-        def combined_score(candidate):
-            return (
-                -np.log10(candidate.predicted_affinity) * 0.4 +
-                candidate.drug_likeness_score * 0.25 +
-                candidate.bbb_permeability * 0.15 +
-                candidate.stability_score * 0.1 +
-                candidate.confidence * 0.1
-            )
-        
-        candidates.sort(key=combined_score, reverse=True)
+        # Sort by composite score (higher is better)
+        ranked_candidates = sorted(filtered_candidates, 
+                                 key=lambda x: x.composite_score, reverse=True)
         
         # Return top candidates
-        return candidates[:min(20, len(candidates))]
+        max_candidates = self.config.get('max_final_candidates')
+        return ranked_candidates[:max_candidates]
     
-    async def _generate_outputs(self, candidates: List[BinderCandidate]):
-        """Generate output files and reports"""
-        # Save candidates as JSON
-        candidates_data = [asdict(c) for c in candidates]
-        with open(self.results_dir / "candidates.json", 'w') as f:
-            json.dump(candidates_data, f, indent=2)
+    def _calculate_composite_score(self, candidate: BinderCandidate) -> float:
+        """Calculate composite score for ranking"""
+        # Weighted combination of different scores
+        weights = {
+            'binding': 0.3,
+            'confidence': 0.25,
+            'interaction': 0.2,
+            'expressibility': 0.15,
+            'druglikeness': 0.1
+        }
         
-        # Save as CSV for easy analysis
-        df = pd.DataFrame(candidates_data)
-        df.to_csv(self.results_dir / "candidates.csv", index=False)
+        # Normalize scores to 0-1 range
+        normalized_binding = min(1.0, candidate.binding_score / 10.0)
+        normalized_interaction = min(1.0, abs(candidate.interaction_energy) / 20.0)
+        clash_penalty = max(0.0, 1.0 - candidate.clash_score / 10.0)
         
-        # Generate FASTA file for sequences
-        records = []
-        for i, candidate in enumerate(candidates):
+        composite = (
+            weights['binding'] * normalized_binding +
+            weights['confidence'] * candidate.folding_confidence +
+            weights['interaction'] * normalized_interaction +
+            weights['expressibility'] * candidate.expressibility_score +
+            weights['druglikeness'] * candidate.druglikeness_score
+        ) * clash_penalty  # Apply clash penalty
+        
+        return composite
+    
+    def _generate_report(self, final_candidates: List[BinderCandidate]):
+        """Generate comprehensive report of results"""
+        logger.info("Generating final report...")
+        
+        # Create report directory
+        report_dir = self.output_dir / "reports"
+        report_dir.mkdir(exist_ok=True)
+        
+        # Generate summary statistics
+        summary = {
+            'total_candidates_generated': len(self.candidates),
+            'candidates_passing_filters': len(final_candidates),
+            'pipeline_completion_time': datetime.now().isoformat(),
+            'top_candidates': []
+        }
+        
+        # Detailed candidate information
+        for i, candidate in enumerate(final_candidates[:10]):  # Top 10
+            candidate_info = {
+                'rank': i + 1,
+                'id': candidate.id,
+                'sequence': candidate.sequence,
+                'sequence_length': len(candidate.sequence),
+                'binding_score': round(candidate.binding_score, 3),
+                'folding_confidence': round(candidate.folding_confidence, 3),
+                'interaction_energy': round(candidate.interaction_energy, 3),
+                'clash_score': round(candidate.clash_score, 3),
+                'expressibility_score': round(candidate.expressibility_score, 3),
+                'druglikeness_score': round(candidate.druglikeness_score, 3),
+                'composite_score': round(candidate.composite_score, 3)
+            }
+            summary['top_candidates'].append(candidate_info)
+        
+        # Save JSON report
+        with open(report_dir / "summary_report.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        # Generate FASTA file with top sequences
+        top_sequences = []
+        for i, candidate in enumerate(final_candidates):
             record = SeqRecord(
                 Seq(candidate.sequence),
-                id=f"binder_{i+1:03d}",
-                description=f"affinity={candidate.predicted_affinity:.2e} drug_score={candidate.drug_likeness_score:.3f}"
+                id=candidate.id,
+                description=f"rank_{i+1}_score_{candidate.composite_score:.3f}"
             )
-            records.append(record)
+            top_sequences.append(record)
         
-        with open(self.results_dir / "candidates.fasta", 'w') as f:
-            SeqIO.write(records, f, "fasta")
+        SeqIO.write(top_sequences, report_dir / "top_binder_sequences.fasta", "fasta")
         
-        # Generate summary report
-        self._generate_summary_report(candidates)
+        # Generate detailed CSV report
+        df_data = []
+        for candidate in final_candidates:
+            df_data.append({
+                'ID': candidate.id,
+                'Sequence': candidate.sequence,
+                'Length': len(candidate.sequence),
+                'Binding_Score': candidate.binding_score,
+                'Folding_Confidence': candidate.folding_confidence,
+                'Interaction_Energy': candidate.interaction_energy,
+                'Clash_Score': candidate.clash_score,
+                'Expressibility_Score': candidate.expressibility_score,
+                'Druglikeness_Score': candidate.druglikeness_score,
+                'Composite_Score': candidate.composite_score,
+                'Structure_Path': candidate.structure_path
+            })
         
-        self.logger.info(f"Results saved to {self.results_dir}")
+        df = pd.DataFrame(df_data)
+        df.to_csv(report_dir / "detailed_candidates.csv", index=False)
+        
+        # Generate analysis plots (if matplotlib available)
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            # Score distribution plots
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
+            
+            scores = ['binding_score', 'folding_confidence', 'interaction_energy', 
+                     'expressibility_score', 'druglikeness_score', 'composite_score']
+            
+            for i, score in enumerate(scores):
+                values = [getattr(candidate, score) for candidate in final_candidates]
+                axes[i].hist(values, bins=20, alpha=0.7)
+                axes[i].set_title(f'{score.replace("_", " ").title()} Distribution')
+                axes[i].set_xlabel(score.replace("_", " ").title())
+                axes[i].set_ylabel('Count')
+            
+            plt.tight_layout()
+            plt.savefig(report_dir / "score_distributions.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except ImportError:
+            logger.info("Matplotlib not available, skipping plot generation")
+        
+        logger.info(f"Report generated in {report_dir}")
     
-    def _generate_summary_report(self, candidates: List[BinderCandidate]):
-        """Generate a summary report"""
-        report = f"""
-Binder Design Pipeline Summary Report
-====================================
+    def save_checkpoint(self, checkpoint_name: str = "pipeline_checkpoint.pkl"):
+        """Save pipeline state for recovery"""
+        checkpoint_path = self.output_dir / checkpoint_name
+        
+        checkpoint_data = {
+            'config': self.config.base_config,
+            'candidates': self.candidates,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_name: str = "pipeline_checkpoint.pkl"):
+        """Load pipeline state from checkpoint"""
+        checkpoint_path = self.output_dir / checkpoint_name
+        
+        if not checkpoint_path.exists():
+            logger.error(f"Checkpoint file {checkpoint_path} not found")
+            return False
+        
+        try:
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            self.candidates = checkpoint_data['candidates']
+            logger.info(f"Loaded {len(self.candidates)} candidates from checkpoint")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return False
 
-Target Protein: {self.config.target_protein}
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+class DockerManager:
+    """Manages Docker containers for isolated execution"""
+    
+    @staticmethod
+    def create_dockerfile():
+        """Create Dockerfile for the pipeline"""
+        dockerfile_content = """
+FROM continuumio/miniconda3:latest
 
-Configuration:
-- Max binder length: {self.config.max_binder_length}
-- Min binder length: {self.config.min_binder_length}
-- Affinity threshold: {self.config.affinity_threshold:.2e} M
-- Initial candidates: {self.config.n_candidates}
-- Final candidates: {len(candidates)}
+WORKDIR /app
 
-Top 5 Candidates:
-================
+# Install system dependencies
+RUN apt-get update && apt-get install -y \\
+    git \\
+    wget \\
+    curl \\
+    build-essential \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and setup script
+COPY requirements.txt .
+COPY setup_environments.sh .
+
+# Make setup script executable
+RUN chmod +x setup_environments.sh
+
+# Run environment setup
+RUN ./setup_environments.sh
+
+# Copy pipeline code
+COPY . .
+
+# Install Python dependencies
+RUN pip install -r requirements.txt
+
+# Set up entrypoint
+ENTRYPOINT ["python", "binder_pipeline.py"]
 """
         
-        for i, candidate in enumerate(candidates[:5]):
-            report += f"""
-Candidate {i+1}:
-- Sequence: {candidate.sequence}
-- Length: {len(candidate.sequence)} residues
-- Predicted Affinity: {candidate.predicted_affinity:.2e} M
-- Drug-likeness Score: {candidate.drug_likeness_score:.3f}
-- BBB Permeability: {candidate.bbb_permeability:.3f}
-- Stability Score: {candidate.stability_score:.3f}
-- Confidence: {candidate.confidence:.3f}
-
+        with open("Dockerfile", 'w') as f:
+            f.write(dockerfile_content)
+    
+    @staticmethod
+    def create_requirements_file():
+        """Create requirements.txt file"""
+        requirements = """
+biotite>=0.37.0
+biopython>=1.79
+torch>=1.11.0
+transformers>=4.20.0
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+plotly>=5.0.0
 """
         
-        # Save report
-        with open(self.results_dir / "summary_report.txt", 'w') as f:
-            f.write(report)
+        with open("requirements.txt", 'w') as f:
+            f.write(requirements)
+    
+    @staticmethod
+    def create_setup_script():
+        """Create environment setup script"""
+        setup_script = """#!/bin/bash
+set -e
 
+echo "Setting up RFdiffusion environment..."
+conda create -n rfdiffusion python=3.9 -y
+source activate rfdiffusion
+conda install pytorch pytorch-cuda=11.8 -c pytorch -c nvidia -y
+pip install hydra-core omegaconf
+git clone https://github.com/RosettaCommons/RFdiffusion.git
+cd RFdiffusion && pip install -e . && cd ..
+
+echo "Setting up ProteinMPNN environment..."
+conda create -n proteinmpnn python=3.8 -y
+source activate proteinmpnn
+conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia -y
+git clone https://github.com/dauparas/ProteinMPNN.git
+cd ProteinMPNN && pip install -r requirements.txt && cd ..
+
+echo "Setting up AlphaFold environment..."
+conda create -n alphafold python=3.9 -y
+source activate alphafold
+pip install colabfold[alphafold] --no-warn-conflicts
+pip install alphafold3-pytorch
+pip install jax jaxlib
+
+echo "Environment setup complete!"
+"""
+        
+        with open("setup_environments.sh", 'w') as f:
+            f.write(setup_script)
 
 def main():
     """Main execution function"""
-    # Example configuration
-    config = BinderConfig(
-        target_protein="MGSHHHHHHGSGSENLFQGSHGSTLGHVNQAQQGQQQGGGGGGFRKGNVDGKACPVQCTRRRLQVFHGVFGRTCSAPGTCLQFQRQ",
-        max_binder_length=80,
-        min_binder_length=25,
-        affinity_threshold=1e-8,
-        drug_like_filters=True,
-        optimize_bbb_permeability=True,
-        n_candidates=500,
-        n_top_candidates=25
-    )
+    parser = argparse.ArgumentParser(description="Protein Binder Design Pipeline")
     
-    # Create and run pipeline
-    pipeline = BinderDesignPipeline(config)
+    parser.add_argument("--config", type=str, help="Configuration file path")
+    parser.add_argument("--target-pdb", type=str, required=True, 
+                       help="Target protein PDB file path")
+    parser.add_argument("--target-sequence", type=str, required=True,
+                       help="Target protein sequence")
+    parser.add_argument("--setup-envs", action="store_true",
+                       help="Set up conda environments")
+    parser.add_argument("--docker-setup", action="store_true",
+                       help="Create Docker setup files")
+    parser.add_argument("--load-checkpoint", type=str,
+                       help="Load from checkpoint file")
+    parser.add_argument("--output-dir", type=str, default="binder_designs",
+                       help="Output directory")
     
-    # Run asynchronously
-    async def run():
-        candidates = await pipeline.run_pipeline()
-        
-        print(f"\nPipeline completed successfully!")
-        print(f"Generated {len(candidates)} high-quality binder candidates")
-        print(f"Results saved to: {pipeline.results_dir}")
-        
-        if candidates:
-            best = candidates[0]
-            print(f"\nBest candidate:")
-            print(f"Sequence: {best.sequence}")
-            print(f"Predicted affinity: {best.predicted_affinity:.2e} M")
-            print(f"Drug-likeness: {best.drug_likeness_score:.3f}")
-            print(f"BBB permeability: {best.bbb_permeability:.3f}")
+    args = parser.parse_args()
     
-    # Run the pipeline
-    asyncio.run(run())
-
-
-class ExperimentalValidation:
-    """
-    Interface for experimental validation workflows
-    """
+    # Docker setup mode
+    if args.docker_setup:
+        logger.info("Creating Docker setup files...")
+        DockerManager.create_dockerfile()
+        DockerManager.create_requirements_file()
+        DockerManager.create_setup_script()
+        logger.info("Docker files created successfully")
+        return
     
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
+    # Initialize pipeline
+    pipeline = BinderPipeline(args.config)
     
-    def generate_dna_sequences(self, protein_sequences: List[str]) -> Dict[str, str]:
-        """Generate optimized DNA sequences for protein expression"""
-        dna_sequences = {}
-        
-        # Codon optimization table (simplified E. coli)
-        codon_table = {
-            'A': 'GCG', 'R': 'CGT', 'N': 'AAC', 'D': 'GAT', 'C': 'TGC',
-            'E': 'GAA', 'Q': 'CAG', 'G': 'GGC', 'H': 'CAT', 'I': 'ATC',
-            'L': 'CTG', 'K': 'AAA', 'M': 'ATG', 'F': 'TTC', 'P': 'CCG',
-            'S': 'AGC', 'T': 'ACC', 'W': 'TGG', 'Y': 'TAC', 'V': 'GTG'
-        }
-        
-        for i, seq in enumerate(protein_sequences):
-            dna_seq = ''.join(codon_table.get(aa, 'NNN') for aa in seq)
-            dna_sequences[f"binder_{i+1:03d}"] = dna_seq
-        
-        return dna_sequences
+    # Set output directory if specified
+    if args.output_dir:
+        pipeline.output_dir = Path(args.output_dir)
+        pipeline.output_dir.mkdir(exist_ok=True)
     
-    def generate_expression_constructs(self, dna_sequences: Dict[str, str]) -> Dict[str, str]:
-        """Generate expression constructs with affinity tags"""
-        constructs = {}
+    try:
+        # Environment setup mode
+        if args.setup_envs:
+            pipeline.setup_environments()
+            return
         
-        # His-tag for purification
-        his_tag = "ATGCACCACCACCACCACCAC"  # His6 tag
-        stop_codon = "TAA"
+        # Load checkpoint if specified
+        if args.load_checkpoint:
+            if not pipeline.load_checkpoint(args.load_checkpoint):
+                logger.error("Failed to load checkpoint, starting fresh")
         
-        for name, dna_seq in dna_sequences.items():
-            construct = his_tag + dna_seq + stop_codon
-            constructs[name] = construct
+        # Validate input files
+        if not os.path.exists(args.target_pdb):
+            logger.error(f"Target PDB file not found: {args.target_pdb}")
+            return
         
-        return constructs
-    
-    def generate_facs_protocol(self, binder_sequences: List[str]) -> str:
-        """Generate FACS screening protocol"""
-        protocol = f"""
-FACS Screening Protocol for Protein Binders
-==========================================
-
-Materials Required:
-- Target protein (fluorescently labeled)
-- Expression constructs for {len(binder_sequences)} binder candidates
-- FACS-compatible cells (e.g., yeast display system)
-- Flow cytometer with appropriate lasers
-
-Protocol Steps:
-
-1. Cell Preparation:
-   - Transform expression constructs into display cells
-   - Grow cultures to mid-log phase
-   - Induce protein expression (IPTG, 1mM, 3h at 30°C)
-
-2. Binding Assay:
-   - Wash cells 3x with PBS + 0.1% BSA
-   - Incubate with fluorescent target protein (100nM, 1h, 4°C)
-   - Wash 3x to remove unbound protein
-   - Analyze by flow cytometry
-
-3. Sorting:
-   - Gate for high fluorescence intensity (top 1-5%)
-   - Collect sorted cells for sequence analysis
-   - Perform multiple rounds of enrichment
-
-4. Analysis:
-   - Sequence enriched clones
-   - Validate binding by additional assays
-   - Determine binding kinetics (SPR/BLI)
-
-Expected Timeline: 3-5 days per round
-Recommended Rounds: 3-4 for optimal enrichment
-        """
+        if not args.target_sequence:
+            logger.error("Target sequence is required")
+            return
         
-        return protocol
-
-
-class AdvancedOptimizer:
-    """
-    Advanced optimization using genetic algorithms and reinforcement learning
-    """
-    
-    def __init__(self, affinity_predictor: AffinityPredictor, drug_predictor: DrugLikenessPredictor):
-        self.affinity_predictor = affinity_predictor
-        self.drug_predictor = drug_predictor
-        self.logger = logging.getLogger(__name__)
-    
-    def genetic_algorithm_optimization(self, population: List[str], target_seq: str, 
-                                     generations: int = 50, population_size: int = 100) -> List[str]:
-        """Advanced genetic algorithm for sequence optimization"""
+        # Run the pipeline
+        logger.info("Starting binder design pipeline...")
+        final_candidates = pipeline.run_pipeline(args.target_pdb, args.target_sequence)
         
-        current_population = population[:population_size]
+        # Save final checkpoint
+        pipeline.save_checkpoint("final_checkpoint.pkl")
         
-        for generation in range(generations):
-            # Evaluate fitness
-            fitness_scores = []
-            for seq in current_population:
-                score = self._fitness_function(seq, target_seq)
-                fitness_scores.append(score)
-            
-            # Selection (tournament selection)
-            parents = self._tournament_selection(current_population, fitness_scores, population_size // 2)
-            
-            # Crossover and mutation
-            offspring = []
-            for i in range(0, len(parents), 2):
-                if i + 1 < len(parents):
-                    child1, child2 = self._crossover(parents[i], parents[i + 1])
-                    child1 = self._mutate(child1)
-                    child2 = self._mutate(child2)
-                    offspring.extend([child1, child2])
-            
-            # Create new population
-            current_population = parents + offspring
-            
-            if generation % 10 == 0:
-                best_score = max(fitness_scores)
-                self.logger.info(f"Generation {generation}: Best fitness = {best_score:.3f}")
+        logger.info(f"Pipeline completed successfully!")
+        logger.info(f"Generated {len(final_candidates)} high-quality binder candidates")
+        logger.info(f"Results saved in: {pipeline.output_dir}")
         
-        # Return best sequences
-        final_scores = [self._fitness_function(seq, target_seq) for seq in current_population]
-        sorted_population = [seq for _, seq in sorted(zip(final_scores, current_population), reverse=True)]
+        # Print top 5 candidates
+        print("\n" + "="*50)
+        print("TOP 5 BINDER CANDIDATES")
+        print("="*50)
         
-        return sorted_population[:20]
-    
-    def _fitness_function(self, binder_seq: str, target_seq: str) -> float:
-        """Multi-objective fitness function"""
-        affinity, confidence = self.affinity_predictor.predict_affinity(binder_seq, target_seq)
-        drug_score = self.drug_predictor.calculate_drug_likeness(binder_seq)
+        for i, candidate in enumerate(final_candidates[:5]):
+            print(f"\nRank {i+1}: {candidate.id}")
+            print(f"Sequence: {candidate.sequence}")
+            print(f"Length: {len(candidate.sequence)} residues")
+            print(f"Composite Score: {candidate.composite_score:.3f}")
+            print(f"Binding Score: {candidate.binding_score:.3f}")
+            print(f"Folding Confidence: {candidate.folding_confidence:.3f}")
+            print(f"Expressibility: {candidate.expressibility_score:.3f}")
+            print("-" * 30)
         
-        # Penalize very long sequences
-        length_penalty = max(0, 1 - (len(binder_seq) - 50) / 50) if len(binder_seq) > 50 else 1
+    except KeyboardInterrupt:
+        logger.info("Pipeline interrupted by user")
+        pipeline.save_checkpoint("interrupted_checkpoint.pkl")
         
-        fitness = (
-            -np.log10(max(affinity, 1e-12)) * 0.4 +
-            drug_score * 0.3 +
-            confidence * 0.2 +
-            length_penalty * 0.1
-        )
-        
-        return fitness
-    
-    def _tournament_selection(self, population: List[str], fitness_scores: List[float], n_parents: int) -> List[str]:
-        """Tournament selection for genetic algorithm"""
-        parents = []
-        
-        for _ in range(n_parents):
-            # Tournament size = 3
-            tournament_indices = np.random.choice(len(population), 3, replace=False)
-            tournament_fitness = [fitness_scores[i] for i in tournament_indices]
-            winner_idx = tournament_indices[np.argmax(tournament_fitness)]
-            parents.append(population[winner_idx])
-        
-        return parents
-    
-    def _crossover(self, parent1: str, parent2: str) -> Tuple[str, str]:
-        """Single-point crossover"""
-        min_len = min(len(parent1), len(parent2))
-        crossover_point = np.random.randint(1, min_len)
-        
-        child1 = parent1[:crossover_point] + parent2[crossover_point:]
-        child2 = parent2[:crossover_point] + parent1[crossover_point:]
-        
-        return child1, child2
-    
-    def _mutate(self, sequence: str, mutation_rate: float = 0.1) -> str:
-        """Point mutation with specified rate"""
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
-        mutated = list(sequence)
-        
-        for i in range(len(mutated)):
-            if np.random.random() < mutation_rate:
-                mutated[i] = np.random.choice(list(amino_acids))
-        
-        return ''.join(mutated)
-
-
-class StructuralAnalyzer:
-    """
-    Advanced structural analysis and binding site prediction
-    """
-    
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-    
-    def analyze_binding_interface(self, binder_pdb: str, target_pdb: str) -> Dict[str, float]:
-        """Analyze binding interface properties"""
-        # Simplified interface analysis
-        # In practice, this would use tools like PyMOL, MDAnalysis, or custom structural analysis
-        
-        interface_data = {
-            'interface_area': np.random.uniform(800, 1500),  # Å²
-            'interface_hydrophobicity': np.random.uniform(0.3, 0.7),
-            'hydrogen_bonds': np.random.randint(3, 12),
-            'salt_bridges': np.random.randint(0, 4),
-            'shape_complementarity': np.random.uniform(0.6, 0.9),
-            'buried_surface_area': np.random.uniform(600, 1200)
-        }
-        
-        return interface_data
-    
-    def predict_binding_pose(self, binder_seq: str, target_pdb: str) -> str:
-        """Predict binding pose using docking simulation"""
-        # Mock docking result
-        docking_result = f"""
-DOCKING RESULT FOR BINDER: {binder_seq[:20]}...
-============================================
-
-Best Pose Score: -8.5 kcal/mol
-RMSD: 1.2 Å
-Interface Contacts: 45
-Binding Site Residues: A:123, A:145, A:167, A:189
-
-Key Interactions:
-- H-bond: Ser15 (binder) -> Asp123 (target)
-- Salt bridge: Arg22 (binder) -> Glu145 (target)
-- Hydrophobic: Leu30 (binder) -> Phe167 (target)
-        """
-        
-        return docking_result
-    
-    def calculate_stability_metrics(self, sequence: str) -> Dict[str, float]:
-        """Calculate sequence-based stability metrics"""
-        metrics = {}
-        
-        # Instability index (simplified)
-        instability_weights = {
-            'A': 1.0, 'R': -2.5, 'N': -0.5, 'D': -0.5, 'C': 1.0,
-            'E': 1.5, 'Q': -0.5, 'G': -0.4, 'H': -0.5, 'I': 1.8,
-            'L': 1.8, 'K': -1.5, 'M': 1.9, 'F': 2.8, 'P': -1.6,
-            'S': -0.5, 'T': -0.7, 'W': -0.9, 'Y': 1.3, 'V': 4.2
-        }
-        
-        instability = sum(instability_weights.get(aa, 0) for aa in sequence) / len(sequence)
-        metrics['instability_index'] = instability
-        
-        # Aliphatic index
-        aliphatic_aas = {'A': 2.9, 'I': 4.9, 'L': 3.9, 'V': 4.2}
-        aliphatic = sum(sequence.count(aa) * weight for aa, weight in aliphatic_aas.items())
-        metrics['aliphatic_index'] = aliphatic / len(sequence) * 100
-        
-        # Grand average of hydropathy (GRAVY)
-        hydropathy = {
-            'A': 1.8, 'R': -4.5, 'N': -3.5, 'D': -3.5, 'C': 2.5,
-            'E': -3.5, 'Q': -3.5, 'G': -0.4, 'H': -3.2, 'I': 4.5,
-            'L': 3.8, 'K': -3.9, 'M': 1.9, 'F': 2.8, 'P': -1.6,
-            'S': -0.8, 'T': -0.7, 'W': -0.9, 'Y': -1.3, 'V': 4.2
-        }
-        
-        gravy = sum(hydropathy.get(aa, 0) for aa in sequence) / len(sequence)
-        metrics['gravy'] = gravy
-        
-        return metrics
-
-
-class BinderDesignPipeline:
-    """
-    Enhanced main pipeline with advanced features
-    """
-    
-    def __init__(self, config: BinderConfig):
-        self.config = config
-        self.logger = self._setup_logging()
-        
-        # Initialize components
-        self.structure_predictor = ProteinStructurePredictor()
-        self.affinity_predictor = AffinityPredictor()
-        self.drug_predictor = DrugLikenessPredictor()
-        self.sequence_generator = SequenceGenerator()
-        self.optimizer = BinderOptimizer(self.affinity_predictor, self.drug_predictor)
-        self.advanced_optimizer = AdvancedOptimizer(self.affinity_predictor, self.drug_predictor)
-        self.structural_analyzer = StructuralAnalyzer()
-        self.experimental_validator = ExperimentalValidation()
-        
-        # Results storage
-        self.candidates: List[BinderCandidate] = []
-        self.results_dir = Path(f"binder_design_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        self.results_dir.mkdir(exist_ok=True)
-    
-    def _setup_logging(self) -> logging.Logger:
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('binder_pipeline.log'),
-                logging.StreamHandler()
-            ]
-        )
-        return logging.getLogger(__name__)
-    
-    async def run_enhanced_pipeline(self) -> List[BinderCandidate]:
-        """Run the enhanced binder design pipeline with advanced optimization"""
-        self.logger.info("Starting enhanced binder design pipeline")
-        self.logger.info(f"Target protein: {self.config.target_protein}")
-        
-        # Step 1: Generate initial candidate sequences
-        self.logger.info("Generating initial candidate sequences...")
-        initial_sequences = await self._generate_candidates()
-        
-        # Step 2: Predict affinities
-        self.logger.info("Predicting binding affinities...")
-        await self._predict_affinities(initial_sequences)
-        
-        # Step 3: Advanced genetic algorithm optimization
-        self.logger.info("Running genetic algorithm optimization...")
-        top_sequences = [c.sequence for c in sorted(self.candidates, 
-                        key=lambda x: x.predicted_affinity)[:100]]
-        optimized_sequences = self.advanced_optimizer.genetic_algorithm_optimization(
-            top_sequences, self.config.target_protein, generations=30
-        )
-        
-        # Step 4: Re-evaluate optimized sequences
-        self.logger.info("Re-evaluating optimized sequences...")
-        optimized_candidates = []
-        for seq in optimized_sequences:
-            affinity, confidence = self.affinity_predictor.predict_affinity(
-                seq, self.config.target_protein
-            )
-            drug_score = self.drug_predictor.calculate_drug_likeness(seq)
-            bbb_score = self.drug_predictor.predict_bbb_permeability(seq)
-            stability_metrics = self.structural_analyzer.calculate_stability_metrics(seq)
-            
-            candidate = BinderCandidate(
-                sequence=seq,
-                predicted_affinity=affinity,
-                drug_likeness_score=drug_score,
-                bbb_permeability=bbb_score,
-                stability_score=stability_metrics['instability_index'],
-                confidence=confidence,
-                structure_pdb=await self.structure_predictor.predict_structure(seq)
-            )
-            optimized_candidates.append(candidate)
-        
-        # Step 5: Structural analysis
-        self.logger.info("Performing structural analysis...")
-        await self._perform_structural_analysis(optimized_candidates)
-        
-        # Step 6: Final ranking and selection
-        final_candidates = self._final_ranking(optimized_candidates)
-        
-        # Step 7: Generate comprehensive outputs
-        await self._generate_enhanced_outputs(final_candidates)
-        
-        self.logger.info(f"Enhanced pipeline completed. Generated {len(final_candidates)} optimized candidates")
-        return final_candidates
-    
-    async def _perform_structural_analysis(self, candidates: List[BinderCandidate]):
-        """Perform detailed structural analysis"""
-        for candidate in candidates:
-            # Analyze stability
-            stability_metrics = self.structural_analyzer.calculate_stability_metrics(candidate.sequence)
-            candidate.stability_score = 1.0 / (1.0 + abs(stability_metrics['instability_index']))
-            
-            # Predict binding pose
-            binding_pose = self.structural_analyzer.predict_binding_pose(
-                candidate.sequence, self.config.target_protein
-            )
-            
-            # Store additional structural data
-            if not hasattr(candidate, 'structural_data'):
-                candidate.structural_data = {}
-            candidate.structural_data['binding_pose'] = binding_pose
-            candidate.structural_data['stability_metrics'] = stability_metrics
-    
-    def _final_ranking(self, candidates: List[BinderCandidate]) -> List[BinderCandidate]:
-        """Final ranking with comprehensive scoring"""
-        def comprehensive_score(candidate):
-            affinity_score = -np.log10(max(candidate.predicted_affinity, 1e-12))
-            drug_score = candidate.drug_likeness_score
-            stability_score = candidate.stability_score
-            confidence_score = candidate.confidence
-            
-            # Size penalty for very large binders
-            size_penalty = max(0, 1 - (len(candidate.sequence) - 50) / 50) if len(candidate.sequence) > 50 else 1
-            
-            total_score = (
-                affinity_score * 0.35 +
-                drug_score * 0.25 +
-                stability_score * 0.2 +
-                confidence_score * 0.1 +
-                size_penalty * 0.1
-            )
-            
-            return total_score
-        
-        candidates.sort(key=comprehensive_score, reverse=True)
-        return candidates[:25]
-    
-    async def _generate_enhanced_outputs(self, candidates: List[BinderCandidate]):
-        """Generate comprehensive outputs including experimental protocols"""
-        # Generate all standard outputs
-        await self._generate_outputs(candidates)
-        
-        # Generate DNA sequences for cloning
-        protein_sequences = [c.sequence for c in candidates]
-        dna_sequences = self.experimental_validator.generate_dna_sequences(protein_sequences)
-        
-        # Save DNA sequences
-        with open(self.results_dir / "dna_sequences.json", 'w') as f:
-            json.dump(dna_sequences, f, indent=2)
-        
-        # Generate expression constructs
-        constructs = self.experimental_validator.generate_expression_constructs(dna_sequences)
-        with open(self.results_dir / "expression_constructs.json", 'w') as f:
-            json.dump(constructs, f, indent=2)
-        
-        # Generate FACS protocol
-        facs_protocol = self.experimental_validator.generate_facs_protocol(protein_sequences)
-        with open(self.results_dir / "facs_protocol.txt", 'w') as f:
-            f.write(facs_protocol)
-        
-        # Generate detailed analysis report
-        self._generate_detailed_report(candidates)
-        
-        self.logger.info("Enhanced outputs generated successfully")
-    
-    def _generate_detailed_report(self, candidates: List[BinderCandidate]):
-        """Generate detailed analysis report"""
-        report = f"""
-Enhanced Binder Design Pipeline - Detailed Report
-================================================
-
-Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Target Protein: {self.config.target_protein}
-Target Length: {len(self.config.target_protein)} residues
-
-Pipeline Configuration:
-- Initial candidates generated: {self.config.n_candidates}
-- Genetic algorithm generations: 30
-- Final candidates selected: {len(candidates)}
-- Affinity threshold: {self.config.affinity_threshold:.2e} M
-
-Optimization Results:
-===================
-
-Top 10 Candidates Summary:
-"""
-        
-        for i, candidate in enumerate(candidates[:10]):
-            stability_data = getattr(candidate, 'structural_data', {}).get('stability_metrics', {})
-            
-            report += f"""
-Rank {i+1}: {candidate.sequence[:30]}{'...' if len(candidate.sequence) > 30 else ''}
-  - Length: {len(candidate.sequence)} residues
-  - Predicted Kd: {candidate.predicted_affinity:.2e} M
-  - Drug Score: {candidate.drug_likeness_score:.3f}
-  - BBB Score: {candidate.bbb_permeability:.3f}
-  - Stability: {candidate.stability_score:.3f}
-  - Confidence: {candidate.confidence:.3f}
-  - GRAVY: {stability_data.get('gravy', 'N/A')}
-  - Instability Index: {stability_data.get('instability_index', 'N/A')}
-"""
-        
-        report += f"""
-
-Experimental Recommendations:
-============================
-
-1. Priority Testing Order:
-   - Start with top 5 candidates for initial validation
-   - Use FACS-based screening for rapid assessment
-   - Confirm hits with SPR or BLI kinetics
-
-2. Expression Strategy:
-   - E. coli expression recommended for initial screening
-   - His-tag purification constructs provided
-   - Consider eukaryotic expression for final validation
-
-3. Applications:
-   - Cryo-EM/tomography: Focus on candidates with length < 50 residues
-   - Protein purification: Prioritize high stability scores
-   - Drug development: Emphasize BBB permeability scores
-
-4. Next Steps:
-   - Synthesize DNA constructs for top candidates
-   - Establish binding assays with target protein
-   - Optimize expression and purification conditions
-   - Validate binding specificity and kinetics
-
-Quality Metrics:
-===============
-- Average predicted affinity: {np.mean([c.predicted_affinity for c in candidates]):.2e} M
-- Average drug-likeness: {np.mean([c.drug_likeness_score for c in candidates]):.3f}
-- Average BBB permeability: {np.mean([c.bbb_permeability for c in candidates]):.3f}
-- Size distribution: {min(len(c.sequence) for c in candidates)}-{max(len(c.sequence) for c in candidates)} residues
-
-Pipeline Performance:
-====================
-- Genetic algorithm improved affinity by average {np.random.uniform(1.5, 3.0):.1f}x
-- Drug-likeness filtering retained {len(candidates)}/{self.config.n_candidates} candidates
-- Structural optimization successful for {len([c for c in candidates if hasattr(c, 'structural_data')])}/{len(candidates)} candidates
-"""
-        
-        with open(self.results_dir / "detailed_analysis_report.txt", 'w') as f:
-            f.write(report)
-
-
-def main():
-    """Main execution function with enhanced pipeline"""
-    # Example configuration for the research scenario
-    config = BinderConfig(
-        target_protein="MGSHHHHHHGSGSENLFQGSHGSTLGHVNQAQQGQQQGGGGGGFRKGNVDGKACPVQCTRRRLQVFHGVFGRTCSAPGTCLQFQRQ",
-        max_binder_length=60,  # Smaller binders for deep tissue penetration
-        min_binder_length=20,
-        affinity_threshold=1e-9,  # High affinity requirement
-        drug_like_filters=True,
-        optimize_bbb_permeability=True,  # For potential drug applications
-        n_candidates=1000,
-        n_top_candidates=50
-    )
-    
-    # Create and run enhanced pipeline
-    pipeline = BinderDesignPipeline(config)
-    
-    async def run_enhanced():
-        print("🧬 Starting AI-Driven Protein Binder Design Pipeline")
-        print("=" * 60)
-        
-        candidates = await pipeline.run_enhanced_pipeline()
-        
-        print(f"\n✅ Enhanced pipeline completed successfully!")
-        print(f"📊 Generated {len(candidates)} high-quality binder candidates")
-        print(f"💾 Results saved to: {pipeline.results_dir}")
-        print(f"🧪 Experimental protocols generated")
-        
-        if candidates:
-            best = candidates[0]
-            print(f"\n🏆 Best candidate:")
-            print(f"   Sequence: {best.sequence}")
-            print(f"   Length: {len(best.sequence)} residues")
-            print(f"   Predicted Kd: {best.predicted_affinity:.2e} M")
-            print(f"   Drug-likeness: {best.drug_likeness_score:.3f}")
-            print(f"   BBB permeability: {best.bbb_permeability:.3f}")
-            print(f"   Stability score: {best.stability_score:.3f}")
-            
-            print(f"\n📋 Files generated:")
-            print(f"   • candidates.json/csv - All candidate data")
-            print(f"   • candidates.fasta - Sequences for cloning")
-            print(f"   • dna_sequences.json - Optimized DNA constructs")
-            print(f"   • expression_constructs.json - Cloning-ready constructs")
-            print(f"   • facs_protocol.txt - Experimental screening protocol")
-            print(f"   • detailed_analysis_report.txt - Comprehensive analysis")
-            
-            print(f"\n🚀 Ready for experimental validation!")
-    
-    # Run the enhanced pipeline
-    asyncio.run(run_enhanced())
-
+    except Exception as e:
+        logger.error(f"Pipeline failed with error: {e}")
+        pipeline.save_checkpoint("error_checkpoint.pkl")
+        raise
 
 if __name__ == "__main__":
     main()
+
+# Additional utility functions for pipeline customization
+
+class CustomScorer:
+    """Extended scoring functions for specialized applications"""
+    
+    @staticmethod
+    def calculate_membrane_compatibility(sequence: str) -> float:
+        """Score for membrane protein binders"""
+        hydrophobic_aas = set(['F', 'W', 'I', 'L', 'V', 'M', 'Y', 'A'])
+        hydrophobic_count = sum(1 for aa in sequence if aa in hydrophobic_aas)
+        return hydrophobic_count / len(sequence)
+    
+    @staticmethod
+    def calculate_protease_resistance(sequence: str) -> float:
+        """Score for protease resistance"""
+        # Avoid protease cleavage sites
+        problematic_motifs = ['KR', 'RR', 'KK', 'FK', 'YK', 'WK']
+        penalty = sum(sequence.count(motif) for motif in problematic_motifs)
+        return max(0.0, 1.0 - penalty / len(sequence))
+    
+    @staticmethod
+    def calculate_immunogenicity_risk(sequence: str) -> float:
+        """Estimate immunogenicity risk"""
+        # Simplified immunogenicity assessment
+        # Avoid human-like sequences and common T-cell epitopes
+        
+        # Check for poly-basic regions
+        basic_stretch = 0
+        max_basic_stretch = 0
+        basic_aas = set(['K', 'R', 'H'])
+        
+        for aa in sequence:
+            if aa in basic_aas:
+                basic_stretch += 1
+                max_basic_stretch = max(max_basic_stretch, basic_stretch)
+            else:
+                basic_stretch = 0
+        
+        risk_score = min(1.0, max_basic_stretch / 5.0)  # Penalize stretches > 5
+        return 1.0 - risk_score
+
+class PipelineOptimizer:
+    """Optimize pipeline parameters based on results"""
+    
+    def __init__(self, pipeline: BinderPipeline):
+        self.pipeline = pipeline
+    
+    def optimize_parameters(self, validation_set: List[BinderCandidate]) -> Dict:
+        """Optimize pipeline parameters using validation results"""
+        
+        # Analyze which parameters correlate with success
+        successful_candidates = [c for c in validation_set if c.composite_score > 0.7]
+        
+        if not successful_candidates:
+            logger.warning("No successful candidates found for optimization")
+            return {}
+        
+        # Analyze sequence properties of successful candidates
+        avg_length = np.mean([len(c.sequence) for c in successful_candidates])
+        avg_hydrophobic = np.mean([
+            sum(1 for aa in c.sequence if aa in 'FWILVMA') / len(c.sequence)
+            for c in successful_candidates
+        ])
+        
+        optimized_params = {
+            'rfdiffusion': {
+                'length': [int(avg_length * 0.8), int(avg_length * 1.2)],
+                'num_designs': min(2000, self.pipeline.config.get('rfdiffusion.num_designs') * 2)
+            },
+            'filtering': {
+                'min_binding_score': np.percentile([c.binding_score for c in successful_candidates], 25),
+                'min_folding_confidence': np.percentile([c.folding_confidence for c in successful_candidates], 25)
+            }
+        }
+        
+        logger.info(f"Optimized parameters: {optimized_params}")
+        return optimized_params
+
+# Example configuration file template
+EXAMPLE_CONFIG = """
+{
+  "target_pdb_path": "kainate_receptor_ATD.pdb",
+  "target_chain": "A",
+  "binding_site_residues": [50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60],
+  
+  "rfdiffusion": {
+    "num_designs": 1000,
+    "length": [50, 80],
+    "contigs": "50-80",
+    "iterations": 50,
+    "scaffold_guided": true
+  },
+  
+  "proteinmpnn": {
+    "num_sequences": 8,
+    "temperature": 0.1,
+    "omit_AA": "CX",
+    "bias_AA": {"K": 0.1, "R": 0.1, "E": -0.1, "D": -0.1}
+  },
+  
+  "alphafold": {
+    "model_type": "alphafold3",
+    "max_msa_clusters": 512,
+    "relaxation_steps": 200
+  },
+  
+  "filtering": {
+    "min_binding_score": 5.0,
+    "min_folding_confidence": 0.7,
+    "max_clash_score": 2.0,
+    "min_interaction_energy": -10.0,
+    "min_expressibility": 0.6
+  },
+  
+  "output_dir": "binder_designs",
+  "max_final_candidates": 20,
+  "parallel_processes": 4
+}
+"""
+
+def create_example_config():
+    """Create example configuration file"""
+    with open("example_config.json", 'w') as f:
+        f.write(EXAMPLE_CONFIG)
+    logger.info("Example configuration file created: example_config.json")
+
+# Usage examples and documentation
+USAGE_EXAMPLES = """
+USAGE EXAMPLES:
+===============
+
+1. Set up environments (run once):
+   python binder_pipeline.py --setup-envs
+
+2. Create Docker files:
+   python binder_pipeline.py --docker-setup
+
+3. Run full pipeline:
+   python binder_pipeline.py \\
+     --target-pdb kainate_receptor.pdb \\
+     --target-sequence "MKVLWAALLV..." \\
+     --config my_config.json \\
+     --output-dir my_binders
+
+4. Resume from checkpoint:
+   python binder_pipeline.py \\
+     --target-pdb kainate_receptor.pdb \\
+     --target-sequence "MKVLWAALLV..." \\
+     --load-checkpoint interrupted_checkpoint.pkl
+
+5. Docker execution:
+   docker build -t binder-pipeline .
+   docker run -v $(pwd)/data:/app/data binder-pipeline \\
+     --target-pdb data/target.pdb \\
+     --target-sequence "SEQUENCE..."
+
+TROUBLESHOOTING:
+================
+
+1. Environment issues:
+   - Ensure CUDA is available for GPU acceleration
+   - Use conda to manage environments
+   - Check disk space (pipeline needs ~50GB)
+
+2. Memory issues:
+   - Reduce num_designs in config
+   - Increase swap space
+   - Use smaller batch sizes
+
+3. Network issues:
+   - Download models manually if automatic download fails
+   - Check firewall settings for git clone operations
+"""
+
+if __name__ == "__main__":
+    # Print usage if no arguments provided
+    if len(sys.argv) == 1:
+        print(USAGE_EXAMPLES)
+        create_example_config()
+    else:
+        main()
+
