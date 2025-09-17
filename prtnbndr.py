@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-# Bioinformatics libraries
+# Bioinformatics packages
 try:
     import biotite.structure as struc
     import biotite.structure.io.pdb as pdb
