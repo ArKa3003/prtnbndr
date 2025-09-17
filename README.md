@@ -2,7 +2,7 @@
 Comprehensive Protein Binder Design Pipeline
 ============================================
 
-An end-to-end pipeline for computationally generating and evaluating protein binders
+An end-to-end cutting-edge pipeline for computationally generating and evaluating protein binders
 targeting kainate receptor amino-terminal domains using cutting-edge AI/ML frameworks.
 
 Features:
